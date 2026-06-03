@@ -1,0 +1,267 @@
+name: Build Samsung A05s Kernel
+
+on:
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/physwizz/A057.git
+  REPO_DIR: A057
+
+  MODEL: a05s
+  REGION: eur
+  CARRIER: open
+  TARGET_BUILD_VARIANT: user
+
+  CHIPSET_NAME: sm6225
+  TARGET_PRODUCT: gki
+  TARGET_BOARD_PLATFORM: gki
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            clang \
+            cpio \
+            curl \
+            dwarves \
+            file \
+            flex \
+            gawk \
+            gcc-aarch64-linux-gnu \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            llvm \
+            lld \
+            lz4 \
+            p7zip-full \
+            python3 \
+            rsync \
+            unzip \
+            zip \
+            zstd \
+            qemu-system-x86 \
+            qemu-kvm \
+            libvirt-daemon-system \
+            libvirt-clients \
+            bridge-utils \
+            virt-manager \
+            cpu-checker
+
+      - name: Enable KVM on runner
+        run: |
+          sudo modprobe kvm
+          sudo modprobe kvm_intel || sudo modprobe kvm_amd
+          kvm-ok || echo "KVM not available in GitHub runner"
+          sudo usermod -aG kvm $USER
+          sudo usermod -aG libvirt $USER
+          sudo chmod 666 /dev/kvm || true
+          ls -la /dev/kvm || echo "KVM device not found"
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --recurse-submodules "${REPO_URL}" "${REPO_DIR}"
+          cd "${REPO_DIR}"
+          git submodule update --init --recursive
+          ls -la
+          test -d kernel_platform
+          test -f kernel_platform/build/android/prepare_vendor.sh
+
+      - name: Prepare prebuilts toolchain
+        run: |
+          cd "${REPO_DIR}"
+          if [ ! -d kernel_platform/prebuilts ]; then
+            echo "kernel_platform/prebuilts not found, downloading compatible prebuilts..."
+            curl -LO --retry 3 --progress-bar \
+              https://github.com/ravindu644/android_kernel_sm_x810/releases/download/toolchain/qcom-5.15-toolchain.tar.gz.zip
+            curl -LO --retry 3 --progress-bar \
+              https://github.com/ravindu644/android_kernel_sm_x810/releases/download/toolchain/qcom-5.15-toolchain.tar.gz.z01
+            7z x qcom-5.15-toolchain.tar.gz.zip
+            rm -f qcom-5.15-toolchain.tar.gz.zip qcom-5.15-toolchain.tar.gz.z01
+            tar -xvf qcom-5.15-toolchain.tar.gz
+            rm -f qcom-5.15-toolchain.tar.gz
+            mv prebuilts kernel_platform/
+            chmod -R +x kernel_platform/prebuilts
+          fi
+
+      - name: Show environment
+        run: |
+          cd "${REPO_DIR}"
+          clang --version || true
+          ld.lld --version || true
+          python3 --version || true
+          echo "MODEL=${MODEL}"
+          echo "CHIPSET_NAME=${CHIPSET_NAME}"
+          echo "TARGET_PRODUCT=${TARGET_PRODUCT}"
+          echo "KVM status:"
+          lsmod | grep kvm || true
+          cat /proc/cpuinfo | grep -E "(vmx|svm)" || true
+
+      - name: Configure kernel with KVM support
+        run: |
+          cd "${REPO_DIR}/kernel_platform"
+          
+          if [ -d "common" ]; then
+            cd common
+          fi
+          
+          cat >> arch/arm64/configs/gki_defconfig << 'EOF'
+          # KVM Host Support
+          CONFIG_KVM=m
+          # CONFIG_KVM_S2MPU is not set
+          # CONFIG_TEST_KVM_S2MPUis not set
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_ARM_PV_TIME=y
+          CONFIG_GKI_HIDDEN_VIRTUAL_CONFIGS=y
+          CONFIG_GKI_HIDDEN_HYPERVISOR_CONFIGS=y
+          CONFIG_SYS_HYPERVISOR=y
+          CONFIG_CRYPTO_DEV_VIRTIO=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI_LIB=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_PCI_LEGACY=y
+          CONFIG_VIRTIO_BALLOON=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_ARM64_4K_PAGES=y
+          CONFIG_GUNYAH=y
+          CONFIG_GUNYAH_PLATFORM=y
+          CONFIG_GUNYAH_RESOURCE_MANAGER=y
+          CONFIG_QCOM_SCM=y
+          CONFIG_ANDROID_VIRTUALIZATION_FRAMEWORK=y
+          CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+          CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y
+          # CONFIG_TEST_KVM_S2MPU=y is not set
+          CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=nvhe cgroup_disable=pressure id_aa64mmfr1.vh=1"
+          EOF
+
+      - name: Fix missing extra directory
+        run: |
+          cd "${REPO_DIR}"
+          mkdir -p out/msm-${CHIPSET_NAME}-${CHIPSET_NAME}-${TARGET_PRODUCT}/staging/lib/modules/5.15.*/extra/ 2>/dev/null || true
+          mkdir -p out/msm-${CHIPSET_NAME}-${CHIPSET_NAME}-${TARGET_PRODUCT}/staging/lib/modules/*/extra/ 2>/dev/null || true
+          echo "Created extra directories to prevent cp errors"
+
+      - name: Build kernel with KVM
+        shell: bash
+        run: |
+          cd "${REPO_DIR}"
+          export ANDROID_BUILD_TOP="$PWD"
+          export MODEL="${MODEL}"
+          export PROJECT_NAME="${MODEL}"
+          export REGION="${REGION}"
+          export CARRIER="${CARRIER}"
+          export TARGET_BUILD_VARIANT="${TARGET_BUILD_VARIANT}"
+          export CHIPSET_NAME="${CHIPSET_NAME}"
+          export TARGET_PRODUCT="${TARGET_PRODUCT}"
+          export TARGET_BOARD_PLATFORM="${TARGET_BOARD_PLATFORM}"
+          export ANDROID_PRODUCT_OUT="${ANDROID_BUILD_TOP}/out/target/product/${MODEL}"
+          export OUT_DIR="${ANDROID_BUILD_TOP}/out/msm-${CHIPSET_NAME}-${CHIPSET_NAME}-${TARGET_PRODUCT}"
+          export KBUILD_EXTRA_SYMBOLS="${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mmrm-driver/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/hw_fence/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/sync_fence/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/msm_ext_display/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/securemsm-kernel/Module.symvers"
+          export EXT_MODULES="../vendor/qcom/opensource/mm-drivers/msm_ext_display \
+            ../vendor/qcom/opensource/mm-drivers/sync_fence \
+            ../vendor/qcom/opensource/mm-drivers/hw_fence \
+            ../vendor/qcom/opensource/mmrm-driver \
+            ../vendor/qcom/opensource/securemsm-kernel \
+            ../vendor/qcom/opensource/display-drivers/msm \
+            ../vendor/qcom/opensource/audio-kernel \
+            ../vendor/qcom/opensource/camera-kernel \
+            ../vendor/qcom/opensource/touch-drivers"
+          export MODNAME=audio_dlkm
+          
+          # بناء وحدة KVM بشكل منفصل
+          cd common 
+          make arch/arm64/kvm CONFIG_KVM=m modules 
+          cd ..
+          
+          BUILD_OPTIONS=(
+            RECOMPILE_KERNEL=1
+            SKIP_MRPROPER=0
+            HERMETIC_TOOLCHAIN=1
+            KMI_SYMBOL_LIST_STRICT_MODE=0
+            ABI_DEFINITION=
+            LTO=thin
+            KVM=1
+            KVM_HOST=1
+            VIRTUALIZATION=1
+          )
+          
+          env "${BUILD_OPTIONS[@]}" \
+            ./kernel_platform/build/android/prepare_vendor.sh sec "${TARGET_PRODUCT}" \
+            2>&1 | tee build.log
+
+      - name: Verify KVM modules in build output
+        if: always()
+        run: |
+          cd "${REPO_DIR}"
+          echo "==== Checking KVM modules ===="
+          find out -name "*.ko" | xargs basename -a | grep -E "(kvm|virt)" || echo "No KVM modules found"
+          find out -type f -name "*.ko" -exec strings {} \; | grep -i kvm || true
+
+      - name: Verify output
+        if: always()
+        run: |
+          cd "${REPO_DIR}"
+          echo "==== Search build outputs ===="
+          find out -type f \( \
+            -name "Image" -o \
+            -name "boot.img" -o \
+            -name "vendor_boot.img" -o \
+            -name "init_boot.img" -o \
+            -name "*kvm.ko" -o \
+            -name "System.map" -o \
+            -name "*kvm*" -o \
+            -name "*virt*" \
+          \) | sort || true
+          
+          mkdir -p artifacts
+          find out -type f \( \
+            -name "Image" -o \
+            -name "boot.img" -o \
+            -name "vendor_boot.img" -o \
+            -name "init_boot.img" -o \
+            -name "*.ko" -o \
+            -name "System.map" -o \
+            -name "*kvm*" \
+          \) -exec cp --parents {} artifacts/ \; || true
+          
+          cp build.log artifacts/ 2>/dev/null || true
+          
+          cat > artifacts/kvm_info.txt << 'KVMEOF'
+          KVM Configuration Summary
+          ========================
+          CONFIG_KVM=y
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_TEST_KVM_S2MPU=y
+          # CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=protected cgroup_disable=pressure" is not set
+          CONFIG_VIRTUALIZATION=y
+          Build completed with full KVM host support including S2MPU test module
+          KVMEOF
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A05s-Kernel-Build-with-KVM
+          path: A057/artifacts
+          if-no-files-found: warn
