@@ -1,0 +1,256 @@
+name: Build Kernel SM-A057F (KVM Support)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: Hichem299/Kvm
+          fetch-depth: 1
+          clean: true
+
+      - name: Setup Build Environment
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libfl-dev \
+            git \
+            flex \
+            bison \
+            libelf-dev \
+            zlib1g-dev \
+            python3 \
+            python-is-python3 \
+            cpio \
+            rsync \
+            wget \
+            curl \
+            unzip
+
+          # Bazel
+          sudo apt-get install -y apt-transport-https gnupg
+          curl -fsSL https://bazel.build/bazel-release.pub.gpg \
+            | gpg --dearmor > bazel-archive-keyring.gpg
+          sudo mv bazel-archive-keyring.gpg /usr/share/keyrings/
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bazel-archive-keyring.gpg] \
+            https://storage.googleapis.com/bazel-apt stable jdk1.8" \
+            | sudo tee /etc/apt/sources.list.d/bazel.list
+          sudo apt-get update -y && sudo apt-get install -y bazel
+
+      - name: Setup Proton Clang
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${GITHUB_WORKSPACE}/toolchain"
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang.git \
+            "${GITHUB_WORKSPACE}/toolchain/clang"
+
+      - name: Locate Kernel Platform
+        shell: bash
+        run: |
+          set -e
+
+          # البحث عن kernel_platform
+          KP_PATH="$(find "${GITHUB_WORKSPACE}" -maxdepth 3 \
+            -type d -name "kernel_platform" | head -n 1)"
+
+          if [ -z "$KP_PATH" ]; then
+            echo "❌ kernel_platform غير موجود، جاري البحث عن msm-kernel..."
+            MSM_PATH="$(find "${GITHUB_WORKSPACE}" -maxdepth 4 \
+              -type d -name "msm-kernel" | head -n 1)"
+            if [ -z "$MSM_PATH" ]; then
+              echo "❌ لم يُعثر على kernel_platform أو msm-kernel"
+              find "${GITHUB_WORKSPACE}" -maxdepth 3 -type d | sort
+              exit 1
+            fi
+            # إنشاء رابط kernel_platform -> parent of msm-kernel
+            KP_PATH="$(dirname "$MSM_PATH")"
+          fi
+
+          echo "✅ kernel_platform: $KP_PATH"
+          echo "KP_PATH=$KP_PATH" >> "$GITHUB_ENV"
+
+          # ANDROID_BUILD_TOP = parent of kernel_platform
+          ANDROID_BUILD_TOP="$(dirname "$KP_PATH")"
+          echo "ANDROID_BUILD_TOP=$ANDROID_BUILD_TOP" >> "$GITHUB_ENV"
+
+      - name: Create KVM Config Fragment
+        shell: bash
+        run: |
+          set -e
+          cat > "${GITHUB_WORKSPACE}/kvm.fragment" <<'EOF'
+          CONFIG_KVM=m
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_ARM_PV_TIME=y
+          CONFIG_GKI_HIDDEN_VIRTUAL_CONFIGS=y
+          CONFIG_GKI_HIDDEN_HYPERVISOR_CONFIGS=y
+          CONFIG_SYS_HYPERVISOR=y
+          CONFIG_CRYPTO_DEV_VIRTIO=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI_LIB=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_PCI_LEGACY=y
+          CONFIG_VIRTIO_BALLOON=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_ARM64_4K_PAGES=y
+          CONFIG_GUNYAH=y
+          CONFIG_GUNYAH_PLATFORM=y
+          CONFIG_GUNYAH_RESOURCE_MANAGER=y
+          CONFIG_QCOM_SCM=y
+          CONFIG_ANDROID_VIRTUALIZATION_FRAMEWORK=y
+          CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+          CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y
+          CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=nvhe cgroup_disable=pressure id_aa64mmfr1.vh=1"
+          EOF
+          echo "✅ KVM fragment جاهز"
+
+      - name: Inject KVM Config into Defconfig
+        shell: bash
+        run: |
+          set -e
+          DEFCONFIG_PATH="${KP_PATH}/msm-kernel/arch/arm64/configs/vendor/m269-gki_defconfig"
+
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            echo "❌ defconfig غير موجود: $DEFCONFIG_PATH"
+            find "${KP_PATH}" -path "*/arm64/configs/*defconfig" | sort
+            exit 1
+          fi
+
+          echo "✅ إضافة KVM options إلى defconfig..."
+          cat "${GITHUB_WORKSPACE}/kvm.fragment" >> "$DEFCONFIG_PATH"
+          echo "✅ تم الحقن"
+
+      - name: Build Kernel via prepare_vendor (Bazel)
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+
+          # ======= متغيرات build script الأصلي =======
+          BUILD_TARGET="a057f_EUR_OPEN"
+          export MODEL=$(echo $BUILD_TARGET | cut -d'_' -f1)          # a057f
+          export PROJECT_NAME=${MODEL}
+          export REGION=$(echo $BUILD_TARGET | cut -d'_' -f2)         # EUR
+          export CARRIER=$(echo $BUILD_TARGET | cut -d'_' -f3)        # OPEN
+          export TARGET_BUILD_VARIANT="userdebug"
+
+          CHIPSET_NAME="sm6375"   # عدّل حسب chipset الفعلي لـ A057F
+
+          export ANDROID_BUILD_TOP="${ANDROID_BUILD_TOP}"
+          export TARGET_PRODUCT=gki
+          export TARGET_BOARD_PLATFORM=gki
+
+          export ANDROID_PRODUCT_OUT="${ANDROID_BUILD_TOP}/out/target/product/${MODEL}"
+          export OUT_DIR="${ANDROID_BUILD_TOP}/out/msm-${CHIPSET_NAME}-${CHIPSET_NAME}-${TARGET_PRODUCT}"
+
+          # symvers للـ techpack drivers
+          export KBUILD_EXTRA_SYMBOLS="\
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mmrm-driver/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/hw_fence/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/sync_fence/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/mm-drivers/msm_ext_display/Module.symvers \
+            ${ANDROID_BUILD_TOP}/out/vendor/qcom/opensource/securemsm-kernel/Module.symvers"
+
+          export MODNAME=audio_dlkm
+
+          export KBUILD_EXT_MODULES="\
+            ../vendor/qcom/opensource/mm-drivers/msm_ext_display \
+            ../vendor/qcom/opensource/mm-drivers/sync_fence \
+            ../vendor/qcom/opensource/mm-drivers/hw_fence \
+            ../vendor/qcom/opensource/mmrm-driver \
+            ../vendor/qcom/opensource/securemsm-kernel \
+            ../vendor/qcom/opensource/display-drivers/msm \
+            ../vendor/qcom/opensource/audio-kernel \
+            ../vendor/qcom/opensource/camera-kernel"
+
+          mkdir -p "${ANDROID_PRODUCT_OUT}"
+          mkdir -p "${OUT_DIR}"
+
+          # ======= تشغيل prepare_vendor عبر Bazel =======
+          echo "🚀 بدء البناء عبر prepare_vendor.sh (Bazel)..."
+          cd "${KP_PATH}"
+
+          RECOMPILE_KERNEL=1 \
+            ./build/android/prepare_vendor.sh sec ${TARGET_PRODUCT} \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Locate Build Output
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Artifacts في ANDROID_KERNEL_OUT ==="
+          find "${ANDROID_BUILD_TOP}/device/qcom" -maxdepth 3 -type f | sort || true
+
+          echo "=== Artifacts في OUT_DIR ==="
+          find "${ANDROID_BUILD_TOP}/out" -maxdepth 6 \
+            \( -name "Image" -o -name "*.ko" -o -name "*.dtb" \) | sort || true
+
+      - name: Copy Artifacts to Workspace
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          COLLECT="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "$COLLECT"
+
+          # Image الرئيسي
+          find "${ANDROID_BUILD_TOP}" \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.lz4" \) \
+            -exec cp {} "$COLLECT/" \; 2>/dev/null || true
+
+          # DTBs
+          mkdir -p "$COLLECT/dtbs"
+          find "${ANDROID_BUILD_TOP}" -name "*.dtb" \
+            -exec cp {} "$COLLECT/dtbs/" \; 2>/dev/null || true
+
+          # Modules
+          mkdir -p "$COLLECT/modules"
+          find "${ANDROID_BUILD_TOP}" -name "*.ko" \
+            -exec cp {} "$COLLECT/modules/" \; 2>/dev/null || true
+
+          # Config وlog
+          cp "${GITHUB_WORKSPACE}/build.log" "$COLLECT/" 2>/dev/null || true
+          find "${ANDROID_BUILD_TOP}" -name ".config" \
+            -exec cp {} "$COLLECT/final.config" \; 2>/dev/null || true
+
+          echo "=== محتوى artifacts ==="
+          find "$COLLECT" -type f | sort
+
+      - name: Upload Kernel Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A057F-KVM-Kernel
+          if-no-files-found: warn
+          compression-level: 9
+          path: |
+            artifacts/
