@@ -77,7 +77,7 @@ jobs:
           cat >> "$DEFCONFIG" <<'EOF'
 
           # KVM Support
-          CONFIG_KVM=m
+          CONFIG_KVM=y
           CONFIG_KVM_ARM_HOST=y
           CONFIG_KVM_ARM_PMU=y
           CONFIG_KVM_ARM_PV_TIME=y
