@@ -1,0 +1,21 @@
+name: Cleanup and Reset Branch
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # لتشغيلها يدوياً من واجهة GitHub
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Reset and Clean Workspace
+        run: |
+          git fetch origin
+          git reset --hard origin/main
+          git clean -fd
+          echo "تم تنظيف المشروع بنجاح على سيرفرات GitHub"
