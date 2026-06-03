@@ -1,0 +1,187 @@
+name: Build Kernel SM-A057F (KVM Support)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: true
+
+      - name: Setup Build Environment
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libfl-dev \
+            git \
+            flex \
+            bison \
+            libelf-dev \
+            zlib1g-dev \
+            python3 \
+            python-is-python3 \
+            cpio \
+            rsync
+
+
+      - name: Locate msm-kernel
+        shell: bash
+        run: |
+          set -e
+          MSM_PATH="$(find "${GITHUB_WORKSPACE}" -maxdepth 4 \
+            -type d -name "msm-kernel" | head -n 1)"
+
+          if [ -z "$MSM_PATH" ]; then
+            echo "❌ msm-kernel غير موجود"
+            find "${GITHUB_WORKSPACE}" -maxdepth 3 -type d | sort
+            exit 1
+          fi
+
+          echo "✅ msm-kernel: $MSM_PATH"
+          echo "MSM_PATH=$MSM_PATH" >> "$GITHUB_ENV"
+
+      - name: Inject KVM Config
+        shell: bash
+        run: |
+          set -e
+          DEFCONFIG="${MSM_PATH}/arch/arm64/configs/vendor/m269-gki_defconfig"
+
+          cat >> "$DEFCONFIG" <<'EOF'
+
+          # KVM Support
+          CONFIG_KVM=y
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_ARM_PV_TIME=y
+          CONFIG_GKI_HIDDEN_VIRTUAL_CONFIGS=y
+          CONFIG_GKI_HIDDEN_HYPERVISOR_CONFIGS=y
+          CONFIG_SYS_HYPERVISOR=y
+          CONFIG_CRYPTO_DEV_VIRTIO=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI_LIB=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_PCI_LEGACY=y
+          CONFIG_VIRTIO_BALLOON=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_ARM64_4K_PAGES=y
+          CONFIG_GUNYAH=y
+          CONFIG_GUNYAH_PLATFORM=y
+          CONFIG_GUNYAH_RESOURCE_MANAGER=y
+          CONFIG_QCOM_SCM=y
+          CONFIG_ANDROID_VIRTUALIZATION_FRAMEWORK=y
+          CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+          CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y
+          CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=nvhe cgroup_disable=pressure id_aa64mmfr1.vh=1"
+          EOF
+
+          echo "✅ KVM options مُضافة إلى defconfig"
+
+      - name: Configure Kernel
+        shell: bash
+        run: |
+          set -e
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          cd "${MSM_PATH}"
+
+          make ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            vendor/m269-gki_defconfig
+
+          make ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
+
+          cp .config "${GITHUB_WORKSPACE}/final.config"
+          echo "✅ Config جاهزة"
+
+      - name: Build Kernel
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+
+          cd "${MSM_PATH}"
+
+          make -j"$(nproc --all)" \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+          echo "✅ البناء اكتمل"
+
+      - name: Collect Artifacts
+        if: always()
+        shell: bash
+        run: |
+          COLLECT="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "$COLLECT/dtbs" "$COLLECT/modules"
+
+          # Image
+          find "${MSM_PATH}/arch/arm64/boot" \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.lz4" \) \
+            -exec cp {} "$COLLECT/" \; 2>/dev/null || true
+
+          # DTBs
+          find "${MSM_PATH}/arch/arm64/boot/dts" \
+            -name "*.dtb" \
+            -exec cp {} "$COLLECT/dtbs/" \; 2>/dev/null || true
+
+          # Modules
+          find "${MSM_PATH}" \
+            -name "*.ko" \
+            -exec cp {} "$COLLECT/modules/" \; 2>/dev/null || true
+
+          cp "${GITHUB_WORKSPACE}/final.config" "$COLLECT/" 2>/dev/null || true
+          cp "${GITHUB_WORKSPACE}/build.log"    "$COLLECT/" 2>/dev/null || true
+
+          echo "=== Artifacts ==="
+          find "$COLLECT" -type f | sort
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A057F-KVM-Kernel
+          if-no-files-found: warn
+          compression-level: 9
+          path: artifacts/
