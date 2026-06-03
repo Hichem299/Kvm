@@ -1,0 +1,113 @@
+name: Build Kernel SM-A057F (KVM Support)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: Hichem299/Kvm
+          fetch-depth: 1
+
+      - name: Setup Build Environment
+        run: |
+          echo "إعداد بيئة البناء وتثبيت الحزم اللازمة..."
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential bc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libssl-dev libfl-dev curl unzip git ccache flex bison wget python3 libelf-dev zlib1g-dev cpio
+          
+      - name: Setup Proton Clang
+        run: |
+          echo "جلب مترجم Proton Clang..."
+          mkdir -p ${GITHUB_WORKSPACE}/toolchain
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ${GITHUB_WORKSPACE}/toolchain/clang
+
+      - name: Inject KVM Configurations to defconfig
+        run: |
+          echo "البحث الذكي عن ملفات defconfig وحقن الإعدادات..."
+          
+          KVM_CONFIGS="
+          # KVM Host Support
+          CONFIG_KVM=m
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_ARM_PV_TIME=y
+          CONFIG_GKI_HIDDEN_VIRTUAL_CONFIGS=y
+          CONFIG_GKI_HIDDEN_HYPERVISOR_CONFIGS=y
+          CONFIG_SYS_HYPERVISOR=y
+          CONFIG_CRYPTO_DEV_VIRTIO=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI_LIB=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_PCI_LEGACY=y
+          CONFIG_VIRTIO_BALLOON=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_ARM64_4K_PAGES=y
+          CONFIG_GUNYAH=y
+          CONFIG_GUNYAH_PLATFORM=y
+          CONFIG_GUNYAH_RESOURCE_MANAGER=y
+          CONFIG_QCOM_SCM=y
+          CONFIG_ANDROID_VIRTUALIZATION_FRAMEWORK=y
+          CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+          CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y
+          CONFIG_CMDLINE=\"stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=nvhe cgroup_disable=pressure id_aa64mmfr1.vh=1\"
+          "
+
+          # البحث عن أي ملف يحمل اسم gki_defconfig في المستودع بالكامل وحقنه
+          find . -type f -name "gki_defconfig" | while read -r file; do
+            echo "جاري الحقن في المسار المكتشف: $file"
+            echo "$KVM_CONFIGS" >> "$file"
+          done
+
+      - name: Build Kernel (A057F)
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang
+          
+          echo "البحث عن المجلد الرئيسي للبناء (المجلد الذي يحتوي على msm-kernel)..."
+          # البحث عن مسار مجلد msm-kernel الحقيقي والدخول إليه
+          MSM_PATH=$(find . -type d -name "msm-kernel" | head -n 1)
+          
+          if [ -z "$MSM_PATH" ]; then
+             echo "❌ خطأ: لم يتم العثور على مجلد msm-kernel في أي مكان داخل المستودع!"
+             exit 1
+          fi
+          
+          echo "✅ تم العثور على المجلد في: $MSM_PATH"
+          cd "$MSM_PATH"
+          
+          # إنشاء مجلد المخرجات الخارجي في جذر ساحة العمل لضمان عدم ضياعه
+          mkdir -p ${GITHUB_WORKSPACE}/out
+          
+          # توليد ملف الإعدادات
+          make O=${GITHUB_WORKSPACE}/out ARCH=arm64 CC=clang vendor/m269-gki_defconfig gki_defconfig
+          
+          # بدء البناء الفعلي
+          make -j$(nproc --all) O=${GITHUB_WORKSPACE}/out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+      - name: Upload Kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: A057F-KVM-Kernel
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dts/vendor/qcom/*.dtb
+          compression-level: 9
