@@ -1,0 +1,201 @@
+name: Build Kernel SM-A057F (KVM Support)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: Hichem299/Kvm
+          fetch-depth: 1
+          clean: true
+
+      - name: Setup Build Environment
+        shell: bash
+        run: |
+          set -e
+          echo "Mise en place de l'environnement de compilation..."
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libfl-dev \
+            curl \
+            unzip \
+            git \
+            ccache \
+            flex \
+            bison \
+            wget \
+            python3 \
+            libelf-dev \
+            zlib1g-dev \
+            cpio \
+            rsync.                                   - name: Locate Kernel Tree
+        shell: bash
+        run: |
+          set -e
+          echo "Recherche du dossier msm-kernel..."
+          MSM_PATH="$(find "${GITHUB_WORKSPACE}" -type d -name "msm-kernel" | head -n 1)"
+
+          if [ -z "$MSM_PATH" ]; then
+            echo "❌ Erreur: dossier msm-kernel introuvable."
+            exit 1
+          fi
+
+          echo "✅ msm-kernel trouvé: $MSM_PATH"
+          echo "MSM_PATH=$MSM_PATH" >> "$GITHUB_ENV"
+
+      - name: Clean Source Tree
+        shell: bash
+        run: |
+          set -e
+          cd "${MSM_PATH}"
+
+          echo "Nettoyage de l'arbre source..."
+          make ARCH=arm64 mrproper || true
+
+          rm -rf "${GITHUB_WORKSPACE}/out"
+          mkdir -p "${GITHUB_WORKSPACE}/out"
+
+      - name: Create KVM Config Fragment
+        shell: bash
+        run: |
+          set -e
+          cat > "${GITHUB_WORKSPACE}/kvm.fragment" <<'EOF'
+          CONFIG_KVM=m
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_ARM_PV_TIME=y
+          CONFIG_GKI_HIDDEN_VIRTUAL_CONFIGS=y
+          CONFIG_GKI_HIDDEN_HYPERVISOR_CONFIGS=y
+          CONFIG_SYS_HYPERVISOR=y
+          CONFIG_CRYPTO_DEV_VIRTIO=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI_LIB=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_PCI_LEGACY=y
+          CONFIG_VIRTIO_BALLOON=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_ARM64_4K_PAGES=y
+          CONFIG_GUNYAH=y
+          CONFIG_GUNYAH_PLATFORM=y
+          CONFIG_GUNYAH_RESOURCE_MANAGER=y
+          CONFIG_QCOM_SCM=y
+          CONFIG_ANDROID_VIRTUALIZATION_FRAMEWORK=y
+          CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+          CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y
+          CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=nvhe cgroup_disable=pressure id_aa64mmfr1.vh=1"
+          EOF
+
+          echo "✅ Fragment KVM créé."
+
+      - name: Configure Kernel
+        shell: bash
+        run: |
+          set -e
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang
+
+          cd "${MSM_PATH}"
+
+          echo "Vérification du defconfig..."
+          # تعديل ذكي للتحقق من مسار ملف الـ vendor الفعلي في شجرة كوالكوم
+          DEFCONFIG_FILE=""
+          if [ -f "arch/arm64/configs/vendor/m269-gki_defconfig" ]; then
+            DEFCONFIG_FILE="vendor/m269-gki_defconfig"
+          elif [ -f "arch/arm64/configs/m269-gki_defconfig" ]; then
+            DEFCONFIG_FILE="m269-gki_defconfig"
+          else
+            echo "❌ Erreur: m269-gki_defconfig introuvable"
+            find arch/arm64/configs -type f | sed 's#^# - #'
+            exit 1
+          fi
+
+          echo "✅ Génération de la configuration de base via $DEFCONFIG_FILE..."
+          make O="${GITHUB_WORKSPACE}/out" ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- "$DEFCONFIG_FILE"
+
+          echo "✅ Injection des options KVM..."
+          cat "${GITHUB_WORKSPACE}/kvm.fragment" >> "${GITHUB_WORKSPACE}/out/.config"
+
+          echo "✅ Résolution des dépendances via olddefconfig..."
+          make O="${GITHUB_WORKSPACE}/out" ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          echo "✅ Sauvegarde de la config finale..."
+          cp "${GITHUB_WORKSPACE}/out/.config" "${GITHUB_WORKSPACE}/out/final.config"
+
+      - name: Build Kernel
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang
+
+          cd "${MSM_PATH}"
+
+          echo "🚀 Début de la compilation du kernel..."
+          # إزالة خيارات التضارب القياسية وفرض تمرير مسارات المترجم بالكامل لتخطي توقف البناء المفاجئ
+          make -j"$(nproc --all)" \
+            O="${GITHUB_WORKSPACE}/out" \
+            ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            2>&1 | tee "${GITHUB_WORKSPACE}/out/build.log"
+
+      - name: Show Output Files
+        if: always()
+        shell: bash
+        run: |
+          echo "Contenu du dossier out :"
+          find "${GITHUB_WORKSPACE}/out" -maxdepth 6 -type f | sort || true
+
+      - name: Upload Kernel Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A057F-KVM-Kernel
+          if-no-files-found: warn
+          compression-level: 9
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/Image.lz4
+            out/arch/arm64/boot/dtb
+            out/arch/arm64/boot/dts/**/*.dtb
+            out/final.config
+            out/build.log
