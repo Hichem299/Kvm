@@ -1,0 +1,146 @@
+name: Build Kernel SM-A057F (KVM Support)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      DEFCONFIG: vendor/m269-gki_defconfig
+      OUT_DIR: out
+      KERNEL_NAME: A057F-KVM-Kernel
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: true
+
+      - name: Setup Build Environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential bc flex bison rsync cpio git curl zip unzip \
+            python3 python-is-python3 pahole dwarves libelf-dev libssl-dev \
+            zlib1g-dev libfl-dev libncurses-dev \
+            clang lld llvm llvm-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Locate msm-kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MSM_PATH="$(find "${GITHUB_WORKSPACE}" -maxdepth 4 -type d -name "msm-kernel" | head -n 1)"
+          if [ -z "$MSM_PATH" ]; then
+            echo "msm-kernel not found"
+            find "${GITHUB_WORKSPACE}" -maxdepth 4 -type d | sort
+            exit 1
+          fi
+          echo "MSM_PATH=$MSM_PATH" >> "$GITHUB_ENV"
+          echo "Found msm-kernel at: $MSM_PATH"
+
+      - name: Verify Source And Toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "${MSM_PATH}/arch/arm64/configs/${DEFCONFIG}"
+          clang --version
+          ld.lld --version
+          aarch64-linux-gnu-gcc --version
+          arm-linux-gnueabi-gcc --version
+
+      - name: Create KVM Fragment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > "${GITHUB_WORKSPACE}/kvm.fragment" <<'EOF'
+          CONFIG_VIRTUALIZATION=y
+          CONFIG_KVM=y
+          CONFIG_KVM_ARM_HOST=y
+          CONFIG_KVM_ARM_PMU=y
+          CONFIG_KVM_MMIO=y
+          CONFIG_VHOST=y
+          CONFIG_VHOST_MENU=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_VIRTIO_INPUT=y
+          CONFIG_ARM64_VHE=y
+          CONFIG_QCOM_SCM=y
+          EOF
+
+      - name: Configure Kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "${MSM_PATH}"
+          make O="${OUT_DIR}" ARCH=${ARCH} CC=clang LLVM=1 LLVM_IAS=0 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            "${DEFCONFIG}"
+
+          if [ -x "scripts/kconfig/merge_config.sh" ]; then
+            bash scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
+              "${OUT_DIR}/.config" "${GITHUB_WORKSPACE}/kvm.fragment"
+          else
+            cat "${GITHUB_WORKSPACE}/kvm.fragment" >> "${OUT_DIR}/.config"
+          fi
+
+          yes "" | make O="${OUT_DIR}" ARCH=${ARCH} CC=clang LLVM=1 LLVM_IAS=0 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            oldconfig
+
+          cp "${OUT_DIR}/.config" "${GITHUB_WORKSPACE}/final.config"
+          grep -E '^(CONFIG_VIRTUALIZATION|CONFIG_KVM|CONFIG_KVM_ARM_HOST|CONFIG_KVM_ARM_PMU|CONFIG_VIRTIO|CONFIG_VHOST|CONFIG_ARM64_VHE)=' \
+            "${GITHUB_WORKSPACE}/final.config" || true
+
+      - name: Build Kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          set -o pipefail
+          cd "${MSM_PATH}"
+          make -j"$(nproc --all)" O="${OUT_DIR}" ARCH=${ARCH} CC=clang LLVM=1 LLVM_IAS=0 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Print Last Build Lines On Failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo "===== LAST 200 LINES OF build.log ====="
+          tail -n 200 "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Collect Artifacts
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          COLLECT="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "$COLLECT/dtbs" "$COLLECT/modules"
+          find "${MSM_PATH}/${OUT_DIR}/arch/arm64/boot" \( -name "Image" -o -name "Image.gz" -o -name "Image.lz4" \) -exec cp {} "$COLLECT/" \; 2>/dev/null || true
+          find "${MSM_PATH}/${OUT_DIR}/arch/arm64/boot/dts" -name "*.dtb" -exec cp {} "$COLLECT/dtbs/" \; 2>/dev/null || true
+          find "${MSM_PATH}/${OUT_DIR}" -name "*.ko" -exec cp {} "$COLLECT/modules/" \; 2>/dev/null || true
+          cp "${GITHUB_WORKSPACE}/final.config" "$COLLECT/" 2>/dev/null || true
+          cp "${GITHUB_WORKSPACE}/build.log" "$COLLECT/" 2>/dev/null || true
+          find "$COLLECT" -type f | sort || true
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A057F-KVM-Kernel
+          if-no-files-found: warn
+          compression-level: 9
+          path: artifacts/
