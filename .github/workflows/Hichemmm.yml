@@ -1,0 +1,132 @@
+name: build-kvm-ko
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kvm-ko:
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      KBUILD_BUILD_USER: github-actions
+      KBUILD_BUILD_HOST: github
+      LOCALVERSION: -gha
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: boerck/android_kernel_samsung_universal8895_kvm
+          ref: master
+          submodules: recursive
+          fetch-depth: 0
+          path: kernel
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            flex \
+            gcc-aarch64-linux-gnu \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            pahole \
+            rsync \
+            unzip \
+            wget
+
+      - name: Show tool versions
+        working-directory: kernel
+        run: |
+          pwd
+          ls -la | head
+          ${CROSS_COMPILE}gcc --version
+          make --version
+
+      - name: Clean tree
+        working-directory: kernel
+        run: |
+          make mrproper
+
+      - name: Generate base config
+        working-directory: kernel
+        run: |
+          make exynos8895-dreamlte_defconfig
+
+      - name: Patch KVM to be modular
+        working-directory: kernel
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+
+          p = Path("arch/arm64/kvm/Kconfig")
+          s = p.read_text()
+
+          old1 = 'config KVM\n\tbool "Kernel-based Virtual Machine (KVM) support"'
+          new1 = 'config KVM\n\ttristate "Kernel-based Virtual Machine (KVM) support"'
+
+          old2 = 'config KVM_ARM_HOST\n\tbool'
+          new2 = 'config KVM_ARM_HOST\n\ttristate'
+
+          if old1 not in s:
+              raise SystemExit("Could not find CONFIG_KVM bool entry")
+          if old2 not in s:
+              raise SystemExit("Could not find CONFIG_KVM_ARM_HOST bool entry")
+
+          s = s.replace(old1, new1, 1)
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+
+          print("Patched arch/arm64/kvm/Kconfig successfully.")
+          PY
+
+      - name: Enable required config options
+        working-directory: kernel
+        run: |
+          ./scripts/config --file .config -e MODULES
+          ./scripts/config --file .config -e VIRTUALIZATION
+          ./scripts/config --file .config -m KVM
+          ./scripts/config --file .config -m KVM_ARM_HOST
+          ./scripts/config --file .config -d ARM64_16K_PAGES || true
+          make olddefconfig
+
+      - name: Print final KVM config
+        working-directory: kernel
+        run: |
+          grep -E '^(CONFIG_MODULES|CONFIG_VIRTUALIZATION|CONFIG_KVM|CONFIG_KVM_ARM_HOST|CONFIG_ARM64_16K_PAGES)=' .config || true
+
+      - name: Build modules
+        working-directory: kernel
+        run: |
+          make -j"$(nproc)" modules
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find kernel -type f \( -name "kvm.ko" -o -name "*.ko" \) | sort | tee out/module-list.txt || true
+
+          if [ -f kernel/arch/arm64/kvm/kvm.ko ]; then
+            cp kernel/arch/arm64/kvm/kvm.ko out/
+          else
+            echo "kvm.ko was not produced"
+            cat out/module-list.txt || true
+            exit 1
+          fi
+
+          cp kernel/.config out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: exynos8895-kvm-ko
+          path: out/
+          if-no-files-found: error
